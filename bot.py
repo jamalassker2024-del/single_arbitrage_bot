@@ -7,7 +7,7 @@ from decimal import Decimal
 # --- V12.2 THE GHOST ENGINE: KEYLESS NEWS + MASTER BOT ---
 CONFIG = {
     "BINANCE_SYMBOL": "BTCUSDT",
-    "TRADE_SIZE_USD": Decimal("5.00"),
+    "TRADE_SIZE_USD": Decimal("2.00"),
     "PULSE_SENSITIVITY": Decimal("0.00025"),
     "POLL_SPEED": 0.25,
     "NEWS_FEEDS": [
@@ -23,7 +23,7 @@ logger = logging.getLogger("OctoGhost-V12.2")
 class GhostEngine:
     def __init__(self):
         self.last_price = None
-        self.shadow_balance = Decimal("20")
+        self.shadow_balance = Decimal("10")
         self.news_multiplier = Decimal("1.0")
         self.hot_keywords = ["BREAKING", "CRASH", "SEC", "LIQUIDATION", "PUMP", "SURGE"]
 
