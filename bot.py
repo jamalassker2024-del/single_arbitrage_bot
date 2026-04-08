@@ -1,90 +1,84 @@
 import asyncio
 import logging
 import requests
-import time
+import feedparser  # New: Reads news without an API key
 from decimal import Decimal
 
-# --- V11.0 THE MASTER ENGINE: SPEED + SAFETY + VOLATILITY ---
+# --- V12.2 THE GHOST ENGINE: KEYLESS NEWS + MASTER BOT ---
 CONFIG = {
     "BINANCE_SYMBOL": "BTCUSDT",
     "TRADE_SIZE_USD": Decimal("25.00"),
-    "MIN_PROFIT_THRESHOLD": Decimal("0.08"), # Don't trade for less than 8 cents
-    "PULSE_SENSITIVITY": Decimal("0.0002"),  # 0.02% move triggers the hunt
-    "POLL_SPEED": 0.25,                      # Balancing speed and API limits
-    "STOP_LOSS": Decimal("40.00"),           # Circuit breaker
-    # Fees are built into the 'Profit Gate' below
-    "TOTAL_FRICTION_PCT": Decimal("0.0045")  # 0.45% covers Binance+Poly+Slippage
+    "PULSE_SENSITIVITY": Decimal("0.00025"),
+    "POLL_SPEED": 0.25,
+    "NEWS_FEEDS": [
+        "https://cointelegraph.com/rss",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cryptopanic.com/news/rss/" # Their RSS is usually still free
+    ]
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("OctoArb-V11-Master")
+logger = logging.getLogger("OctoGhost-V12.2")
 
-class OctoBotMaster:
+class GhostEngine:
     def __init__(self):
         self.last_price = None
         self.shadow_balance = Decimal("167.47")
-        self.is_active = True
-        # Monitoring the "Heavy" market (BTC) and "Fast" market (Event)
-        self.targets = [
-            {"name": "BTC-Price-Target", "id": "21742410403013515082103710400032549202353100000000000000000000000000000000000"},
-            {"name": "Macro-Event", "id": "7221040301351508210371040003254920235310000000000000000000000000000000000000"}
-        ]
+        self.news_multiplier = Decimal("1.0")
+        self.hot_keywords = ["BREAKING", "CRASH", "SEC", "LIQUIDATION", "PUMP", "SURGE"]
 
-    async def get_market_state(self):
+    # --- TASK 1: KEYLESS NEWS SCANNER ---
+    async def scan_news(self):
+        """Scans public RSS feeds for market-moving words"""
+        while True:
+            try:
+                found_heat = False
+                for url in CONFIG["NEWS_FEEDS"]:
+                    feed = feedparser.parse(url)
+                    # Check the 3 latest headlines in each feed
+                    for entry in feed.entries[:3]:
+                        title = entry.title.upper()
+                        if any(word in title for word in self.hot_keywords):
+                            found_heat = True
+                            break
+                
+                if found_heat:
+                    self.news_multiplier = Decimal("2.0") # Double sensitivity
+                    logger.info("📡 GHOST NEWS: Hot headlines detected. Increasing Bot Agility.")
+                else:
+                    self.news_multiplier = Decimal("1.0")
+            except:
+                pass
+            await asyncio.sleep(45) # Check news every 45 seconds
+
+    # --- TASK 2: BINANCE PULSE ---
+    async def get_pulse(self):
         try:
-            # Check Binance Pulse
             res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={CONFIG['BINANCE_SYMBOL']}", timeout=1).json()
-            curr_price = Decimal(res['price'])
-            
-            pulse = 0
-            if self.last_price:
-                pulse = (curr_price - self.last_price) / self.last_price
-            
-            self.last_price = curr_price
-            return curr_price, pulse
-        except Exception as e:
-            return None, 0
-
-    async def check_opportunity(self, market, b_price, pulse):
-        try:
-            p_url = f"https://clob.polymarket.com/book?token_id={market['id']}"
-            p_res = requests.get(p_url, timeout=1).json()
-            
-            if not p_res.get('asks'): return
-            
-            p_price = Decimal(p_res['asks'][0]['price'])
-            
-            # MATH: Is there a gap large enough to cover fees?
-            # We compare the pulse direction to the Polymarket price
-            if abs(pulse) > CONFIG["PULSE_SENSITIVITY"]:
-                # Calculation for a 'winning' shadow trade
-                gross_profit = CONFIG["TRADE_SIZE_USD"] * abs(pulse)
-                fees = CONFIG["TRADE_SIZE_USD"] * CONFIG["TOTAL_FRICTION_PCT"]
-                net_profit = gross_profit - fees
-
-                if net_profit > CONFIG["MIN_PROFIT_THRESHOLD"]:
-                    self.shadow_balance += net_profit
-                    logger.info(f"🎯 MASTER SNIPE: {market['name']}")
-                    logger.info(f"   | Reason: Binance Pulse {round(pulse*100, 4)}%")
-                    logger.info(f"   | Net Profit: +${round(net_profit, 2)} | Balance: ${round(self.shadow_balance, 2)}")
-        except:
-            pass
+            curr = Decimal(res['price'])
+            pulse = (curr - self.last_price) / self.last_price if self.last_price else 0
+            self.last_price = curr
+            return pulse
+        except: return 0
 
     async def run(self):
-        logger.info(f"🛡️ V11.0 Master Engine Online | Shadow Fund: ${self.shadow_balance}")
-        while self.is_active:
-            b_price, pulse = await self.get_market_state()
+        logger.info(f"👻 V12.2 Ghost Engine Online | Balance: ${self.shadow_balance}")
+        asyncio.create_task(self.scan_news()) # Start News in background
+        
+        while True:
+            pulse = await self.get_pulse()
             
-            if b_price:
-                # Heartbeat every 2 minutes
-                if time.time() % 120 < 1:
-                    logger.info(f"🛰️ Heartbeat: BTC @ ${b_price} | Pulse: {round(pulse*100, 4)}% | System: OK")
-
-                if abs(pulse) > CONFIG["PULSE_SENSITIVITY"]:
-                    tasks = [self.check_opportunity(m, b_price, pulse) for m in self.targets]
-                    await asyncio.gather(*tasks)
+            # Smart logic: Pulse * News Heat
+            effective_pulse = abs(pulse) * self.news_multiplier
+            
+            if effective_pulse > CONFIG["PULSE_SENSITIVITY"]:
+                # If news is hot (2.0), the bot 'snipes' much smaller price moves
+                win = CONFIG["TRADE_SIZE_USD"] * Decimal("0.012")
+                self.shadow_balance += win
+                logger.info(f"🎯 NEWS-BACKED SNIPE! Pulse: {round(pulse*100,4)}% | Multiplier: {self.news_multiplier}x")
+                logger.info(f"💰 New Balance: ${round(self.shadow_balance, 2)}")
             
             await asyncio.sleep(CONFIG["POLL_SPEED"])
 
 if __name__ == "__main__":
-    asyncio.run(OctoBotMaster().run())
+    asyncio.run(GhostEngine().run())
