@@ -3,84 +3,91 @@ import json
 import websockets
 from decimal import Decimal
 import time
+import sys
 
-# --- INSTITUTIONAL CONFIG ---
+# --- INSTITUTIONAL MULTI-PAIR CONFIG ---
 CONFIG = {
-    "SYMBOL": "BTCUSDT",
-    "BINANCE_FEE": Decimal("0.001"), # 0.1% Taker
-    "BYBIT_FEE": Decimal("0.001"),   # 0.1% Taker
-    "MIN_SPREAD_THRESHOLD": Decimal("0.0035"), # 0.35% (Covers fees + slippage)
-    "SLIPPAGE_PROTECTION": Decimal("0.0005"),  
+    # Top 10 Volatile Pairs for 2026 Lead-Lag
+    "SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "SUIUSDT", 
+                "AVAXUSDT", "APTUSDT", "ARBUSDT", "DOGEUSDT", "NEARUSDT"],
+    "BINANCE_FEE": Decimal("0.001"), 
+    "BYBIT_FEE": Decimal("0.001"),   
+    "MIN_SPREAD_THRESHOLD": Decimal("0.0028"), # Lowered to 0.28% for aggressive entry
+    "SLIPPAGE_PROTECTION": Decimal("0.0004"),  
+    "LOG_INTERVAL": 5
 }
 
-class LeadLagArb:
+class SovereignScalper:
     def __init__(self):
-        # We store prices and the last time they were updated
-        self.prices = {"binance": Decimal("0"), "bybit": Decimal("0")}
-        self.last_update = {"binance": 0, "bybit": 0}
+        # Nested dict: self.prices['BTCUSDT']['binance']
+        self.prices = {s: {"binance": Decimal("0"), "bybit": Decimal("0")} for s in CONFIG["SYMBOLS"]}
+        self.last_update = {s: {"binance": 0, "bybit": 0} for s in CONFIG["SYMBOLS"]}
         self.balance = Decimal("2000.00")
+        self.last_log = 0
 
     async def stream_binance(self):
-        url = f"wss://stream.binance.com:9443/ws/{CONFIG['SYMBOL'].lower()}@ticker"
+        # Combined stream: stream?streams=btcusdt@bookTicker/ethusdt@bookTicker...
+        streams = "/".join([f"{s.lower()}@bookTicker" for s in CONFIG["SYMBOLS"]])
+        url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+        
         async with websockets.connect(url) as ws:
             while True:
-                data = json.loads(await ws.recv())
-                self.prices["binance"] = Decimal(data['a']) # Best Ask
-                self.last_update["binance"] = time.time()
+                raw = await ws.recv()
+                data = json.loads(raw)
+                symbol = data['data']['s'] # e.g. BTCUSDT
+                self.prices[symbol]["binance"] = Decimal(data['data']['a']) # Best Ask
+                self.last_update[symbol]["binance"] = time.time()
 
     async def stream_bybit(self):
         url = "wss://stream.bybit.com/v5/public/spot"
         async with websockets.connect(url) as ws:
-            # Subscribe to tickers for Spot
-            await ws.send(json.dumps({"op": "subscribe", "args": [f"tickers.{CONFIG['SYMBOL'].upper()}"]}))
+            # Subscribe to all symbols in one go
+            args = [f"tickers.{s}" for s in CONFIG["SYMBOLS"]]
+            await ws.send(json.dumps({"op": "subscribe", "args": args}))
+            
             while True:
-                raw_data = await ws.recv()
-                data = json.loads(raw_data)
-                
-                # Bybit Spot V5 returns data inside a 'data' object
+                raw = await ws.recv()
+                data = json.loads(raw)
                 if 'data' in data:
-                    ticker_data = data['data']
-                    # Spot ticker can be a list or object; handle ask1Price correctly
-                    if isinstance(ticker_data, dict) and 'ask1Price' in ticker_data:
-                        self.prices["bybit"] = Decimal(ticker_data['ask1Price'])
-                        self.last_update["bybit"] = time.time()
-                    elif isinstance(ticker_data, list) and 'ask1Price' in ticker_data[0]:
-                        self.prices["bybit"] = Decimal(ticker_data[0]['ask1Price'])
-                        self.last_update["bybit"] = time.time()
+                    d = data['data']
+                    symbol = d.get('symbol')
+                    # Bybit Spot V5 uses ask1Price
+                    if symbol in self.prices and 'ask1Price' in d:
+                        self.prices[symbol]["bybit"] = Decimal(d['ask1Price'])
+                        self.last_update[symbol]["bybit"] = time.time()
 
-    async def trade_engine(self):
-        print("⚔️ ARBITRAGE ENGINE ONLINE | Monitoring Lead-Lag...")
+    async def engine(self):
+        print(f"⚔️ SOVEREIGN SCALPER ONLINE | Monitoring {len(CONFIG['SYMBOLS'])} Pairs")
         while True:
-            b_p = self.prices["binance"]
-            by_p = self.prices["bybit"]
             now = time.time()
+            for s in CONFIG["SYMBOLS"]:
+                b_p = self.prices[s]["binance"]
+                by_p = self.prices[s]["bybit"]
 
-            # INSTITUTIONAL RULE: Data must be fresh (less than 1 second old)
-            if (now - self.last_update["binance"] < 1) and (now - self.last_update["bybit"] < 1):
-                if b_p > 0 and by_p > 0:
-                    # Binance is the Leader, Bybit is the Laggard
-                    spread = (b_p - by_p) / by_p
-                    total_costs = CONFIG["BINANCE_FEE"] + CONFIG["BYBIT_FEE"] + CONFIG["SLIPPAGE_PROTECTION"]
+                # Ensure data is fresh (< 2s) and both prices exist
+                if (now - self.last_update[s]["binance"] < 2) and (now - self.last_update[s]["bybit"] < 2):
+                    if b_p > 0 and by_p > 0:
+                        spread = (b_p - by_p).copy_abs() / min(b_p, by_p)
+                        costs = CONFIG["BINANCE_FEE"] + CONFIG["BYBIT_FEE"] + CONFIG["SLIPPAGE_PROTECTION"]
 
-                    if spread > CONFIG["MIN_SPREAD_THRESHOLD"]:
-                        net_profit = spread - total_costs
-                        profit_usd = (Decimal("100.0") * net_profit)
-                        
-                        print(f"\n🚀 ARB FOUND! | LDR: {b_p} | LAG: {by_p} | Spread: {round(spread*100, 3)}%")
-                        print(f"💰 ESTIMATED NET PROFIT: ${round(profit_usd, 3)}")
-                        
-                        self.balance += profit_usd
-                        print(f"🏦 NEW TOTAL BALANCE: ${round(self.balance, 2)}")
-                        await asyncio.sleep(1) # Small cooldown for price to settle
+                        if spread > CONFIG["MIN_SPREAD_THRESHOLD"]:
+                            profit = (Decimal("100.0") * (spread - costs))
+                            self.balance += profit
+                            print(f"\n🚀 ARB: {s} | Spread: {round(spread*100,3)}% | Net: +${round(profit,3)}")
+                            print(f"🏦 BALANCE: ${round(self.balance, 2)}")
+                            # Cooldown per symbol to prevent double-dipping same move
+                            self.last_update[s]["binance"] = 0 
 
+            # Heartbeat Log
+            if now - self.last_log > CONFIG["LOG_INTERVAL"]:
+                sys.stdout.write(f"\r📡 SCANNING {len(CONFIG['SYMBOLS'])} PAIRS | BAL: ${round(self.balance,2)}   ")
+                sys.stdout.flush()
+                self.last_log = now
+            
             await asyncio.sleep(0.01)
 
     async def run(self):
-        await asyncio.gather(
-            self.stream_binance(),
-            self.stream_bybit(),
-            self.trade_engine()
-        )
+        await asyncio.gather(self.stream_binance(), self.stream_bybit(), self.engine())
 
 if __name__ == "__main__":
-    asyncio.run(LeadLagArb().run())
+    asyncio.run(SovereignScalper().run())
