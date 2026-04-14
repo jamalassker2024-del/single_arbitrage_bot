@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-AGGRESSIVE LIMIT SCALPER – WITH REST SNAPSHOT + WS UPDATES
-- Fetches initial order book via REST
-- Applies WebSocket depth diffs
-- Opens trades when OFI > 0.50
+FINAL AGGRESSIVE LIMIT SCALPER – WITH REST SNAPSHOTS + WS UPDATES
+- Market orders for entry and exit (no waiting)
+- TP: 0.10% gross (0.08% net after fees)
+- SL: 0.15% – safe from noise
+- Max hold: 5 seconds
 """
 
 import asyncio
@@ -18,33 +19,34 @@ import time
 getcontext().prec = 12
 
 CONFIG = {
-    "SYMBOLS": ["NEIROUSDT", "DOGSUSDT", "PEPEUSDT", "1000FLOKIUSDT", "WIFUSDT"],
+    "SYMBOLS": ["DOGSUSDT", "NEIROUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT"],
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
-    "OFI_THRESHOLD": Decimal("0.50"),
-    "TAKE_PROFIT_BPS": Decimal("2"),
-    "STOP_LOSS_BPS": Decimal("5"),
-    "MAX_HOLD_SECONDS": 8,
-    "ENTRY_TIMEOUT_SEC": 2,
+    "OFI_LEVELS": 5,
+    "OFI_THRESHOLD": Decimal("0.55"),
+    "TAKE_PROFIT_BPS": Decimal("10"),        # 0.10% gross profit
+    "STOP_LOSS_BPS": Decimal("15"),          # 0.15% stop loss
+    "MAX_HOLD_SECONDS": 5,                   # 5 seconds max
     "WIN_COOLDOWN_SEC": 1,
-    "LOSS_COOLDOWN_SEC": 20,
-    "SCAN_INTERVAL_MS": 20,
+    "LOSS_COOLDOWN_SEC": 15,
+    "SCAN_INTERVAL_MS": 30,
+    "REFRESH_BOOK_SEC": 20,
     "BINANCE_WS": "wss://stream.binance.com:9443/ws",
 }
 
-MAKER_FEE = Decimal("0")
-TAKER_FEE = Decimal("0.001")
+TAKER_FEE = Decimal("0.001")   # 0.1% per market order
 
-class AggressiveScalper:
+class MarketOrderBot:
     def __init__(self):
         self.order_books = {}
         self.positions = {}
-        self.pending_entries = {}
         self.balance = CONFIG["INITIAL_BALANCE"]
         self.total_trades = 0
         self.winning_trades = 0
-        self.last_trade_result = {}
+        self.daily_profit = Decimal('0')
+        self.daily_start = time.time()
         self.last_trade_time = {}
+        self.last_trade_result = {}
         self.running = True
 
     class OrderBook:
@@ -52,21 +54,13 @@ class AggressiveScalper:
             self.symbol = symbol
             self.bids = {}
             self.asks = {}
-            self.last_update = 0
-
-        def set_snapshot(self, bids, asks):
-            """Initialize order book with REST snapshot"""
-            self.bids = {Decimal(p): Decimal(q) for p, q in bids}
-            self.asks = {Decimal(p): Decimal(q) for p, q in asks}
-            self.last_update = time.time()
-            print(f"📸 Snapshot loaded for {self.symbol}: {len(self.bids)} bids, {len(self.asks)} asks")
+            self.last_update = 0.0
 
         def apply_depth(self, data):
-            """Apply depth delta update"""
             for side, key in [('bids', 'b'), ('asks', 'a')]:
                 book_side = getattr(self, side)
-                for p, q in data.get(key, []):
-                    price, qty = Decimal(p), Decimal(q)
+                for price_str, qty_str in data.get(key, []):
+                    price, qty = Decimal(price_str), Decimal(qty_str)
                     if qty == 0:
                         book_side.pop(price, None)
                     else:
@@ -79,12 +73,9 @@ class AggressiveScalper:
         def best_ask(self):
             return min(self.asks.keys()) if self.asks else Decimal('0')
 
-        def tick_size(self):
-            if self.bids:
-                prices = sorted(self.bids.keys())
-                if len(prices) > 1:
-                    return abs(prices[1] - prices[0])
-            return Decimal('0.00000001')
+        def mid_price(self):
+            bb, ba = self.best_bid(), self.best_ask()
+            return (bb + ba) / 2 if bb and ba else Decimal('0')
 
         def get_ofi(self, depth=5):
             sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:depth]
@@ -95,18 +86,25 @@ class AggressiveScalper:
                 return Decimal('0')
             return (bid_vol - ask_vol) / (bid_vol + ask_vol)
 
-    async def fetch_snapshot(self, symbol):
-        url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=20"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                return data['bids'], data['asks']
+        async def refresh_snapshot(self, session):
+            url = f"https://api.binance.com/api/v3/depth?symbol={self.symbol}&limit=20"
+            try:
+                async with session.get(url) as resp:
+                    data = await resp.json()
+                    self.bids = {Decimal(p): Decimal(q) for p, q in data['bids']}
+                    self.asks = {Decimal(p): Decimal(q) for p, q in data['asks']}
+                    self.last_update = time.time()
+                    return True
+            except Exception:
+                return False
+
+    async def load_snapshots(self, session):
+        for sym in CONFIG["SYMBOLS"]:
+            self.order_books[sym] = self.OrderBook(sym)
+            await self.order_books[sym].refresh_snapshot(session)
+            print(f"✅ {sym} ready")
 
     async def subscribe_depth(self, symbol):
-        # First get snapshot
-        bids, asks = await self.fetch_snapshot(symbol)
-        self.order_books[symbol].set_snapshot(bids, asks)
-
         stream = f"{symbol.lower()}@depth20@100ms"
         url = f"{CONFIG['BINANCE_WS']}/{stream}"
         while self.running:
@@ -114,144 +112,195 @@ class AggressiveScalper:
                 async with websockets.connect(url) as ws:
                     async for msg in ws:
                         data = json.loads(msg)
-                        self.order_books[symbol].apply_depth(data)
-            except Exception as e:
-                print(f"⚠️ WebSocket error for {symbol}: {e}. Reconnecting in 3s...")
+                        if 'b' in data or 'a' in data:
+                            self.order_books[symbol].apply_depth(data)
+            except Exception:
                 await asyncio.sleep(3)
 
-    def place_entry_limit(self, symbol, side):
+    def open_market_position(self, symbol, side):
         book = self.order_books[symbol]
-        if side == 'buy':
-            base = book.best_bid()
-            if base <= 0:
-                return
-            price = base + book.tick_size()
-            if price >= book.best_ask():
-                price = book.best_ask() - book.tick_size()
-        else:
-            base = book.best_ask()
-            if base <= 0:
-                return
-            price = base - book.tick_size()
-            if price <= book.best_bid():
-                price = book.best_bid() + book.tick_size()
+        # Market order: buy at ask, sell at bid
+        price = book.best_ask() if side == 'buy' else book.best_bid()
         if price <= 0:
-            return
-
-        qty = CONFIG["ORDER_SIZE_USDT"] / price
-        self.pending_entries[symbol] = {
-            'side': side,
-            'price': price,
-            'qty': qty,
-            'timestamp': time.time()
-        }
-        print(f"📝 LIMIT {side.upper()} Posted: {symbol} @ {price:.8f}")
-
-    def check_fills_and_positions(self):
-        now = time.time()
-
-        # Check pending entries
-        for sym in list(self.pending_entries.keys()):
-            order = self.pending_entries[sym]
-            book = self.order_books[sym]
-            filled = (order['side'] == 'buy' and book.best_ask() <= order['price']) or \
-                     (order['side'] == 'sell' and book.best_bid() >= order['price'])
-            if filled:
-                self.balance -= CONFIG["ORDER_SIZE_USDT"]
-                tp = order['price'] * (1 + CONFIG["TAKE_PROFIT_BPS"]/10000) if order['side'] == 'buy' else order['price'] * (1 - CONFIG["TAKE_PROFIT_BPS"]/10000)
-                sl = order['price'] * (1 - CONFIG["STOP_LOSS_BPS"]/10000) if order['side'] == 'buy' else order['price'] * (1 + CONFIG["STOP_LOSS_BPS"]/10000)
-                self.positions[sym] = {
-                    'side': order['side'],
-                    'entry': order['price'],
-                    'qty': order['qty'],
-                    'tp': tp,
-                    'sl': sl,
-                    'time': now
-                }
-                del self.pending_entries[sym]
-                print(f"✅ FILLED: {sym} @ {order['price']:.8f} | TP limit @ {tp:.8f}")
-            elif now - order['timestamp'] > CONFIG["ENTRY_TIMEOUT_SEC"]:
-                del self.pending_entries[sym]
-                print(f"⌛ ENTRY TIMEOUT: {sym} cancelled")
-
-        # Check active positions
-        for sym in list(self.positions.keys()):
-            pos = self.positions[sym]
-            book = self.order_books[sym]
-            hit_tp = (pos['side'] == 'buy' and book.best_bid() >= pos['tp']) or \
-                     (pos['side'] == 'sell' and book.best_ask() <= pos['tp'])
-            hit_sl = (pos['side'] == 'buy' and book.best_bid() <= pos['sl']) or \
-                     (pos['side'] == 'sell' and book.best_ask() >= pos['sl'])
-            if hit_tp:
-                self.close_trade(sym, pos['tp'], "WIN (LIMIT)")
-            elif hit_sl:
-                exit_price = book.best_bid() if pos['side'] == 'buy' else book.best_ask()
-                self.close_trade(sym, exit_price, "LOSS (SL MARKET)")
-            elif now - pos['time'] > CONFIG["MAX_HOLD_SECONDS"]:
-                exit_price = book.best_bid() if pos['side'] == 'buy' else book.best_ask()
-                self.close_trade(sym, exit_price, "TIMEOUT (MARKET)")
-
-    def close_trade(self, sym, price, reason):
-        pos = self.positions.pop(sym)
-        is_market = "MARKET" in reason
-        fee_rate = TAKER_FEE if is_market else MAKER_FEE
-        gross = pos['qty'] * price
-        fee_amt = gross * fee_rate
-        cost = pos['qty'] * pos['entry']
-        if pos['side'] == 'buy':
-            profit = (gross - cost) - fee_amt
+            return False
+        
+        order_size = CONFIG["ORDER_SIZE_USDT"]
+        if order_size > self.balance:
+            order_size = self.balance * Decimal("0.95")
+            if order_size < Decimal("1.00"):
+                return False
+        
+        qty = order_size / price
+        cost = qty * price
+        fee = cost * TAKER_FEE
+        
+        if cost + fee > self.balance:
+            return False
+        
+        self.balance -= (cost + fee)
+        
+        tp_bps = CONFIG["TAKE_PROFIT_BPS"]
+        sl_bps = CONFIG["STOP_LOSS_BPS"]
+        
+        if side == 'buy':
+            target_price = price * (Decimal("1") + tp_bps / Decimal("10000"))
+            stop_price = price * (Decimal("1") - sl_bps / Decimal("10000"))
         else:
-            profit = (cost - gross) - fee_amt
-        self.balance += gross - fee_amt
+            target_price = price * (Decimal("1") - tp_bps / Decimal("10000"))
+            stop_price = price * (Decimal("1") + sl_bps / Decimal("10000"))
+        
+        self.positions[symbol] = {
+            'side': side,
+            'entry_price': price,
+            'quantity': qty,
+            'entry_time': time.time(),
+            'order_size': order_size,
+            'target_price': target_price,
+            'stop_price': stop_price,
+        }
+        
+        expected_profit = order_size * tp_bps / Decimal("10000") - order_size * TAKER_FEE * 2
+        print(f"⚡ {symbol} MARKET {side.upper()} @ {price:.8f} | ${order_size:.2f} | Target net: +${expected_profit:.4f}")
+        return True
+
+    def check_positions(self, symbol):
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        
+        book = self.order_books[symbol]
+        now = time.time()
+        mid = book.mid_price()
+        if mid <= 0:
+            return
+        
+        if pos['side'] == 'buy':
+            if mid >= pos['target_price']:
+                self.close_market(symbol, 'buy', 'TP')
+                return
+            elif mid <= pos['stop_price']:
+                self.close_market(symbol, 'buy', 'SL')
+                return
+        else:
+            if mid <= pos['target_price']:
+                self.close_market(symbol, 'sell', 'TP')
+                return
+            elif mid >= pos['stop_price']:
+                self.close_market(symbol, 'sell', 'SL')
+                return
+        
+        if now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
+            self.close_market(symbol, pos['side'], 'TIMEOUT')
+
+    def close_market(self, symbol, side, reason):
+        pos = self.positions.pop(symbol, None)
+        if not pos:
+            return
+        
+        book = self.order_books[symbol]
+        # Exit with market order: opposite side
+        if pos['side'] == 'buy':
+            exit_price = book.best_bid()   # sell at bid
+        else:
+            exit_price = book.best_ask()   # buy back at ask
+        
+        if exit_price <= 0:
+            exit_price = book.mid_price()
+        
+        gross = pos['quantity'] * exit_price
+        fee = gross * TAKER_FEE
+        cost_basis = pos['quantity'] * pos['entry_price']
+        profit = (gross - cost_basis) - fee
+        
+        self.balance += gross - fee
         self.total_trades += 1
+        
         if profit > 0:
             self.winning_trades += 1
+            self.last_trade_result[symbol] = 'win'
+        else:
+            self.last_trade_result[symbol] = 'loss'
+        
+        self.daily_profit += profit
+        profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
-        print(f"{'✅' if profit > 0 else '❌'} {reason} {sym} | PnL: ${profit:.4f} | Bal: ${self.balance:.2f} | WR: {win_rate:.1f}%")
-        self.last_trade_time[sym] = time.time()
-        self.last_trade_result[sym] = 'win' if profit > 0 else 'loss'
+        print(f"{'✅ WIN' if profit>0 else '❌ LOSS'} {symbol} {reason} | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        self.last_trade_time[symbol] = time.time()
 
     async def run(self):
-        # Initialize order books with snapshots
+        async with aiohttp.ClientSession() as session:
+            await self.load_snapshots(session)
+        
         for sym in CONFIG["SYMBOLS"]:
-            self.order_books[sym] = self.OrderBook(sym)
             asyncio.create_task(self.subscribe_depth(sym))
-
-        print("🚀 AGGRESSIVE LIMIT SCALPER ACTIVE (0% maker fees)")
-        print(f"   TP: 0.02% pure profit | SL: 0.05% | Max hold: {CONFIG['MAX_HOLD_SECONDS']}s")
-        print(f"   Entry timeout: {CONFIG['ENTRY_TIMEOUT_SEC']}s | OFI threshold: {CONFIG['OFI_THRESHOLD']}\n")
-
-        last_ofi_print = 0
-        while self.running:
-            now = time.time()
-            if now - last_ofi_print > 3:
-                ofi_str = []
-                for sym in CONFIG["SYMBOLS"]:
-                    ofi = self.order_books[sym].get_ofi()
-                    ofi_str.append(f"{sym}:{ofi:.3f}")
-                print(f"🔍 OFI: {' | '.join(ofi_str)}")
-                last_ofi_print = now
-
-            self.check_fills_and_positions()
-
-            for sym in CONFIG["SYMBOLS"]:
-                if sym in self.positions or sym in self.pending_entries:
-                    continue
-                cooldown = CONFIG["LOSS_COOLDOWN_SEC"] if self.last_trade_result.get(sym) == 'loss' else CONFIG["WIN_COOLDOWN_SEC"]
-                if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown:
-                    continue
-                ofi = self.order_books[sym].get_ofi()
-                if ofi > CONFIG["OFI_THRESHOLD"]:
-                    print(f"⚡ {sym} OFI: {ofi:.3f} → BUY")
-                    self.place_entry_limit(sym, 'buy')
-                elif ofi < -CONFIG["OFI_THRESHOLD"]:
-                    print(f"⚡ {sym} OFI: {ofi:.3f} → SELL")
-                    self.place_entry_limit(sym, 'sell')
-
-            await asyncio.sleep(CONFIG["SCAN_INTERVAL_MS"] / 1000.0)
+        
+        print("\n🚀 MARKET ORDER BOT – INSTANT EXECUTION")
+        print(f"   TP: 0.10% gross (0.08% net after fees) | SL: 0.15%")
+        print(f"   Max hold: {CONFIG['MAX_HOLD_SECONDS']}s | Position: ${CONFIG['ORDER_SIZE_USDT']}\n")
+        
+        last_hb = 0
+        last_ofi_debug = 0
+        last_refresh = time.time()
+        
+        async with aiohttp.ClientSession() as session:
+            while self.running:
+                now = time.time()
+                
+                if now - last_refresh > CONFIG["REFRESH_BOOK_SEC"]:
+                    for sym in CONFIG["SYMBOLS"]:
+                        await self.order_books[sym].refresh_snapshot(session)
+                    last_refresh = now
+                
+                if now - last_ofi_debug > 5:
+                    strong = []
+                    for sym in CONFIG["SYMBOLS"]:
+                        ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
+                        if abs(ofi) > 0.35:
+                            strong.append(f"{sym}:{ofi:.3f}")
+                    if strong:
+                        print(f"🔍 OFI: {' | '.join(strong)}")
+                    last_ofi_debug = now
+                
+                # Check positions
+                for sym in list(self.positions.keys()):
+                    self.check_positions(sym)
+                
+                # Open new positions
+                if self.balance >= Decimal("1.00"):
+                    for sym in CONFIG["SYMBOLS"]:
+                        if sym in self.positions:
+                            continue
+                        
+                        cooldown = CONFIG["LOSS_COOLDOWN_SEC"] if self.last_trade_result.get(sym) == 'loss' else CONFIG["WIN_COOLDOWN_SEC"]
+                        if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown:
+                            continue
+                        
+                        ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
+                        
+                        if ofi > CONFIG["OFI_THRESHOLD"]:
+                            print(f"⚡ {sym} OFI: {ofi:.3f} → MARKET BUY")
+                            self.open_market_position(sym, 'buy')
+                        elif ofi < -CONFIG["OFI_THRESHOLD"]:
+                            print(f"⚡ {sym} OFI: {ofi:.3f} → MARKET SELL")
+                            self.open_market_position(sym, 'sell')
+                
+                # Daily summary
+                if now - self.daily_start >= 86400:
+                    print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.4f} | Balance: ${self.balance:.2f}\n")
+                    self.daily_profit = Decimal('0')
+                    self.daily_start = now
+                
+                if now - last_hb > 30:
+                    win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
+                    print(f"📡 Balance: ${self.balance:.2f} | Open: {len(self.positions)} | WR: {win_rate:.1f}% | Trades: {self.total_trades}")
+                    last_hb = now
+                
+                await asyncio.sleep(CONFIG["SCAN_INTERVAL_MS"] / 1000.0)
 
 if __name__ == "__main__":
+    bot = MarketOrderBot()
     try:
-        asyncio.run(AggressiveScalper().run())
+        asyncio.run(bot.run())
     except KeyboardInterrupt:
-        print("\nShutdown complete")
+        bot.running = False
+        print("\nShutdown")
