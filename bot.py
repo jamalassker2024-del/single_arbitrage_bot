@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-PROFITABLE MARKET ORDER BOT – $20 BALANCE (INSTANT FILL)
-- Market orders (instant execution)
-- Extremely small TP: 0.04% (achievable in seconds)
-- Tight SL: 0.03%
-- Loss cooldown: 30 seconds
+PROFITABLE LIMIT ORDER BOT – 0% FEES ENTRY + EXIT
+- Limit orders for entry (0% maker fee)
+- Limit orders for exit (0% maker fee)
+- TP: 0.10% net profit (pure profit, no fees)
+- SL: 0.05%
+- Positions fill when price reaches your levels
 """
 
 import asyncio
@@ -23,19 +24,18 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("0.50"),
     "INITIAL_BALANCE": Decimal("20.00"),
     "OFI_LEVELS": 8,
-    "OFI_THRESHOLD": Decimal("0.60"),
-    "TAKE_PROFIT_BPS": Decimal("4"),       # 0.04% (achievable in seconds!)
-    "STOP_LOSS_BPS": Decimal("3"),         # 0.03%
-    "MAX_HOLD_SECONDS": 5,                 # 5 seconds max
-    "WIN_COOLDOWN_SEC": 1,
-    "LOSS_COOLDOWN_SEC": 30,
-    "SCAN_INTERVAL_MS": 50,
+    "OFI_THRESHOLD": Decimal("0.70"),
+    "TAKE_PROFIT_BPS": Decimal("10"),      # 0.10% pure profit (no fees!)
+    "STOP_LOSS_BPS": Decimal("5"),         # 0.05% loss
+    "MAX_HOLD_SECONDS": 60,                # Wait longer for limit fills
+    "WIN_COOLDOWN_SEC": 2,
+    "LOSS_COOLDOWN_SEC": 45,
+    "SCAN_INTERVAL_MS": 100,
     "REFRESH_BOOK_SEC": 30,
     "BINANCE_WS": "wss://stream.binance.com:9443/ws",
 }
 
-# Market order fees (taker)
-TAKER_FEE = Decimal("0.001")  # 0.1%
+MAKER_FEE = Decimal("0")   # Limit orders = 0% fee
 
 class OrderBook:
     def __init__(self, symbol):
@@ -83,13 +83,14 @@ class OrderBook:
                 self.asks = {Decimal(p): Decimal(q) for p, q in data['asks']}
                 self.last_update = time.time()
                 return True
-        except Exception as e:
+        except Exception:
             return False
 
-class MarketOrderBot:
+class PureLimitBot:
     def __init__(self):
         self.order_books = {s: OrderBook(s) for s in CONFIG["SYMBOLS"]}
         self.positions = {}
+        self.pending_exits = {}  # symbol -> exit_order info
         self.balance = CONFIG["INITIAL_BALANCE"]
         self.total_trades = 0
         self.winning_trades = 0
@@ -117,34 +118,34 @@ class MarketOrderBot:
             except Exception:
                 await asyncio.sleep(3)
 
-    def open_market_position(self, symbol, side):
-        """MARKET ORDER – instant execution at best ask/bid"""
+    def open_position_limit(self, symbol, side):
+        """Place LIMIT order for entry (0% fee)"""
         book = self.order_books[symbol]
         
         if side == 'buy':
-            price = book.best_ask()  # Buy at ask (market buy)
+            price = book.best_bid()
         else:
-            price = book.best_bid()  # Sell at bid (market sell)
+            price = book.best_ask()
         
         if price <= 0:
             return False
         
         order_size = CONFIG["ORDER_SIZE_USDT"]
         if order_size > self.balance:
-            order_size = self.balance * Decimal("0.9")
+            order_size = self.balance * Decimal("0.95")
             if order_size < Decimal("0.10"):
                 return False
         
         qty = order_size / price
         cost = qty * price
-        fee = cost * TAKER_FEE  # Taker fee
+        fee = cost * MAKER_FEE  # 0%
         
         if cost + fee > self.balance:
             return False
         
         self.balance -= (cost + fee)
         
-        # Calculate target prices
+        # Set target and stop prices for exit LIMIT orders
         if side == 'buy':
             target_price = price * (Decimal("1") + CONFIG["TAKE_PROFIT_BPS"] / Decimal("10000"))
             stop_price = price * (Decimal("1") - CONFIG["STOP_LOSS_BPS"] / Decimal("10000"))
@@ -160,57 +161,86 @@ class MarketOrderBot:
             'order_size': order_size,
             'target_price': target_price,
             'stop_price': stop_price,
+            'exit_placed': False,
         }
-        print(f"⚡ MARKET {symbol} {side.upper()} @ {price:.4f} | ${order_size:.2f} | Balance: ${self.balance:.2f}")
+        
+        expected_profit = order_size * (CONFIG["TAKE_PROFIT_BPS"] / Decimal("10000"))
+        print(f"📈 LIMIT ENTRY {symbol} {side.upper()} @ {price:.4f} | ${order_size:.2f} | Target: +${expected_profit:.5f} (0% fee) | Balance: ${self.balance:.2f}")
         return True
 
-    def check_position(self, symbol):
-        """Check if position should close based on current price"""
+    def place_exit_limit_order(self, symbol):
+        """Place a LIMIT order for exit (0% fee)"""
+        pos = self.positions.get(symbol)
+        if not pos or pos.get('exit_placed'):
+            return
+        
+        book = self.order_books[symbol]
+        
+        if pos['side'] == 'buy':
+            # Place sell limit order at target price
+            exit_price = pos['target_price']
+            # Check if price is already above target (shouldn't happen, but just in case)
+            if book.best_bid() >= exit_price:
+                self.close_position_limit(symbol, exit_price, "TP")
+                return
+        else:
+            # Place buy limit order at target price
+            exit_price = pos['target_price']
+            if book.best_ask() <= exit_price:
+                self.close_position_limit(symbol, exit_price, "TP")
+                return
+        
+        pos['exit_placed'] = True
+        pos['exit_price'] = exit_price
+        
+        print(f"📌 LIMIT EXIT {symbol} placed @ {exit_price:.4f} (0% fee) | Will fill when price reaches target")
+        # Note: In a real implementation, you would submit this order to Binance API
+        # For simulation, we'll check if price hits the target in check_positions
+
+    def check_positions(self, symbol):
+        """Check if exit limit order would be filled"""
         pos = self.positions.get(symbol)
         if not pos:
             return
         
         book = self.order_books[symbol]
-        mid = book.mid_price()
-        if mid == 0:
-            return
-        
         now = time.time()
         
-        # Check take profit or stop loss
+        # Check if exit limit order would be filled
         if pos['side'] == 'buy':
-            if mid >= pos['target_price']:
-                self.close_market_position(symbol, "TP")
-            elif mid <= pos['stop_price']:
-                self.close_market_position(symbol, "SL")
-            elif now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
-                self.close_market_position(symbol, "TIMEOUT")
+            current_bid = book.best_bid()
+            if current_bid >= pos['target_price']:
+                self.close_position_limit(symbol, current_bid, "TAKE_PROFIT")
+                return
+            # Check stop loss (use market order for SL to limit losses)
+            elif current_bid <= pos['stop_price']:
+                self.close_position_market(symbol, current_bid, "STOP_LOSS")
+                return
         else:
-            if mid <= pos['target_price']:
-                self.close_market_position(symbol, "TP")
-            elif mid >= pos['stop_price']:
-                self.close_market_position(symbol, "SL")
-            elif now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
-                self.close_market_position(symbol, "TIMEOUT")
+            current_ask = book.best_ask()
+            if current_ask <= pos['target_price']:
+                self.close_position_limit(symbol, current_ask, "TAKE_PROFIT")
+                return
+            elif current_ask >= pos['stop_price']:
+                self.close_position_market(symbol, current_ask, "STOP_LOSS")
+                return
+        
+        # Timeout: close with market order
+        if now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
+            if pos['side'] == 'buy':
+                exit_price = book.best_bid()
+            else:
+                exit_price = book.best_ask()
+            self.close_position_market(symbol, exit_price, "TIMEOUT")
 
-    def close_market_position(self, symbol, reason):
+    def close_position_limit(self, symbol, exit_price, reason):
+        """Close with LIMIT order (0% fee) – pure profit"""
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
         
-        book = self.order_books[symbol]
-        
-        # Exit at opposite market price
-        if pos['side'] == 'buy':
-            exit_price = book.best_bid()
-        else:
-            exit_price = book.best_ask()
-        
-        if exit_price <= 0:
-            exit_price = book.mid_price()
-        
         gross = pos['quantity'] * exit_price
-        fee = gross * TAKER_FEE
+        fee = gross * MAKER_FEE  # 0% fee on limit exit
         cost_basis = pos['quantity'] * pos['entry_price']
         profit = (gross - cost_basis) - fee
         
@@ -225,7 +255,34 @@ class MarketOrderBot:
         
         self.hourly_profit += profit
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
-        print(f"🎯 CLOSE {symbol} {reason} | Profit: ${profit:.5f} ({profit/pos['order_size']*100:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
+        print(f"🎯 LIMIT CLOSE {symbol} {reason} @ {exit_price:.4f} | Profit: ${profit:.5f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        self.last_trade_time[symbol] = time.time()
+
+    def close_position_market(self, symbol, exit_price, reason):
+        """Fallback: close with MARKET order (0.1% fee) – only for SL/timeout"""
+        pos = self.positions.pop(symbol, None)
+        if not pos:
+            return
+        
+        gross = pos['quantity'] * exit_price
+        fee = gross * Decimal("0.001")  # 0.1% taker fee (only on losses)
+        cost_basis = pos['quantity'] * pos['entry_price']
+        profit = (gross - cost_basis) - fee
+        
+        self.balance += gross - fee
+        self.total_trades += 1
+        
+        if profit > 0:
+            self.winning_trades += 1
+            self.last_trade_result[symbol] = 'win'
+        else:
+            self.last_trade_result[symbol] = 'loss'
+        
+        self.hourly_profit += profit
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
+        profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
+        print(f"⚠️ MARKET CLOSE {symbol} {reason} | Profit: ${profit:.5f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[symbol] = time.time()
 
     async def run(self):
@@ -235,9 +292,9 @@ class MarketOrderBot:
         for sym in CONFIG["SYMBOLS"]:
             asyncio.create_task(self.subscribe_depth(sym))
         
-        print("\n🚀 MARKET ORDER BOT – INSTANT EXECUTION")
-        print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']} | TP: {float(CONFIG['TAKE_PROFIT_BPS'])/100:.2f}%")
-        print(f"   Loss cooldown: {CONFIG['LOSS_COOLDOWN_SEC']}s\n")
+        print("\n🚀 PURE LIMIT ORDER BOT – 0% FEES ENTRY + EXIT")
+        print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']} | TP: {float(CONFIG['TAKE_PROFIT_BPS'])/100:.2f}% (pure profit)")
+        print(f"   Stop loss: {float(CONFIG['STOP_LOSS_BPS'])/100:.2f}% | Loss cooldown: {CONFIG['LOSS_COOLDOWN_SEC']}s\n")
         
         last_hb = 0
         last_ofi_debug = 0
@@ -257,15 +314,18 @@ class MarketOrderBot:
                     strong = []
                     for sym in CONFIG["SYMBOLS"]:
                         ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
-                        if abs(ofi) > 0.3:
+                        if abs(ofi) > 0.4:
                             strong.append(f"{sym}:{ofi:.3f}")
                     if strong:
-                        print(f"🔍 OFI: {' | '.join(strong)}")
+                        print(f"🔍 Strong OFI: {' | '.join(strong)}")
                     last_ofi_debug = now
                 
-                # Check positions
+                # Check positions and place exit limit orders
                 for sym in list(self.positions.keys()):
-                    self.check_position(sym)
+                    self.check_positions(sym)
+                    # Place exit limit order if not already placed and position is open
+                    if sym in self.positions and not self.positions[sym].get('exit_placed'):
+                        self.place_exit_limit_order(sym)
                 
                 # Open new positions
                 if self.balance >= Decimal("0.20"):
@@ -280,11 +340,11 @@ class MarketOrderBot:
                         ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
                         
                         if ofi > CONFIG["OFI_THRESHOLD"]:
-                            print(f"⚡ {sym} OFI: {ofi:.3f} → MARKET BUY")
-                            self.open_market_position(sym, 'buy')
+                            print(f"⚡ {sym} OFI: {ofi:.3f} → LIMIT BUY")
+                            self.open_position_limit(sym, 'buy')
                         elif ofi < -CONFIG["OFI_THRESHOLD"]:
-                            print(f"⚡ {sym} OFI: {ofi:.3f} → MARKET SELL")
-                            self.open_market_position(sym, 'sell')
+                            print(f"⚡ {sym} OFI: {ofi:.3f} → LIMIT SELL")
+                            self.open_position_limit(sym, 'sell')
                 
                 # Hourly summary
                 if now - self.last_hour_reset >= 3600:
@@ -301,7 +361,7 @@ class MarketOrderBot:
                 await asyncio.sleep(CONFIG["SCAN_INTERVAL_MS"] / 1000.0)
 
 if __name__ == "__main__":
-    bot = MarketOrderBot()
+    bot = PureLimitBot()
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
