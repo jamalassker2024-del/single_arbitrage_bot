@@ -2,14 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-FINAL HYBRID SCALPER – MARKET ENTRY + LIMIT TP (0% FEE ON WINS)
-- REST snapshots + WebSocket depth diffs (reliable OFI)
-- Market entry (instant fill, 0.1% fee)
-- Limit take‑profit exit (0% maker fee)
-- Market stop‑loss / timeout (0.1% fee only on losers)
-- TP: 0.08% gross → 0.04% net after entry fee
-- SL: 0.06% | Max hold: 4 seconds
-- High win rate, many trades per hour
+FINAL HYBRID SCALPER – NO TIMEOUT, TRAILING STOP
+- Market entry (instant, 0.1% fee)
+- Take-profit limit order (0% fee)
+- Hard stop-loss (0.1% fee)
+- Trailing stop: locks in profit, moves SL to breakeven after 0.02% gain
+- No fixed timer – trades close only via price action
 """
 
 import asyncio
@@ -28,8 +26,8 @@ CONFIG = {
     "OFI_LEVELS": 5,
     "OFI_THRESHOLD": Decimal("0.55"),
     "TAKE_PROFIT_BPS": Decimal("8"),          # 0.08% gross profit
-    "STOP_LOSS_BPS": Decimal("6"),            # 0.06% stop loss
-    "MAX_HOLD_SECONDS": 4,                    # very fast exit
+    "STOP_LOSS_BPS": Decimal("6"),            # 0.06% initial stop loss
+    "TRAIL_BPS": Decimal("2"),                # 0.02% trail distance
     "WIN_COOLDOWN_SEC": 1,
     "LOSS_COOLDOWN_SEC": 15,
     "SCAN_INTERVAL_MS": 20,
@@ -37,10 +35,10 @@ CONFIG = {
     "BINANCE_WS": "wss://stream.binance.com:9443/ws",
 }
 
-TAKER_FEE = Decimal("0.001")   # 0.1% for market entry & emergency exit
-MAKER_FEE = Decimal("0")       # 0% for limit TP exit
+TAKER_FEE = Decimal("0.001")   # market entry & market exit (SL)
+MAKER_FEE = Decimal("0")       # limit TP exit
 
-class HybridScalper:
+class TrailingScalper:
     def __init__(self):
         self.order_books = {}
         self.positions = {}
@@ -122,7 +120,6 @@ class HybridScalper:
                 await asyncio.sleep(3)
 
     def open_market_position(self, symbol, side):
-        """Market entry – instant fill, pays taker fee (0.1%)"""
         book = self.order_books[symbol]
         price = book.best_ask() if side == 'buy' else book.best_bid()
         if price <= 0:
@@ -143,33 +140,55 @@ class HybridScalper:
 
         self.balance -= (cost + fee)
 
-        # Set take‑profit (limit exit, 0% fee) and stop‑loss (market exit)
         tp_bps = CONFIG["TAKE_PROFIT_BPS"]
         sl_bps = CONFIG["STOP_LOSS_BPS"]
+        trail_bps = CONFIG["TRAIL_BPS"]
 
         if side == 'buy':
             target_price = price * (Decimal("1") + tp_bps / Decimal("10000"))
             stop_price = price * (Decimal("1") - sl_bps / Decimal("10000"))
+            best_price = price   # for trailing: highest price seen
         else:
             target_price = price * (Decimal("1") - tp_bps / Decimal("10000"))
             stop_price = price * (Decimal("1") + sl_bps / Decimal("10000"))
+            best_price = price   # for trailing: lowest price seen
 
         self.positions[symbol] = {
             'side': side,
             'entry_price': price,
             'quantity': qty,
-            'entry_time': time.time(),
             'order_size': order_size,
             'target_price': target_price,
             'stop_price': stop_price,
+            'best_price': best_price,
+            'trail_bps': trail_bps,
+            'entry_time': time.time(),
         }
 
         expected_profit = order_size * tp_bps / Decimal("10000") - order_size * TAKER_FEE
         print(f"⚡ {symbol} MARKET {side.upper()} @ {price:.8f} | ${order_size:.2f} | Target net: +${expected_profit:.4f}")
         return True
 
+    def update_trailing_stop(self, pos, current_price):
+        """Update stop price for trailing stop."""
+        if pos['side'] == 'buy':
+            # For long: track highest price, move stop up
+            if current_price > pos['best_price']:
+                pos['best_price'] = current_price
+                new_stop = current_price * (Decimal("1") - pos['trail_bps'] / Decimal("10000"))
+                if new_stop > pos['stop_price']:
+                    pos['stop_price'] = new_stop
+                    print(f"  🔼 Trail: {pos['symbol']} stop moved to {new_stop:.8f}")
+        else:
+            # For short: track lowest price, move stop down
+            if current_price < pos['best_price']:
+                pos['best_price'] = current_price
+                new_stop = current_price * (Decimal("1") + pos['trail_bps'] / Decimal("10000"))
+                if new_stop < pos['stop_price']:
+                    pos['stop_price'] = new_stop
+                    print(f"  🔽 Trail: {pos['symbol']} stop moved to {new_stop:.8f}")
+
     def check_positions(self):
-        now = time.time()
         for sym in list(self.positions.keys()):
             pos = self.positions[sym]
             book = self.order_books[sym]
@@ -177,10 +196,13 @@ class HybridScalper:
             if mid <= 0:
                 continue
 
-            # Take‑profit (limit exit, 0% fee)
+            # Update trailing stop first
+            self.update_trailing_stop(pos, mid)
+
+            # Check take-profit (limit exit, 0% fee)
             hit_tp = (pos['side'] == 'buy' and mid >= pos['target_price']) or \
                      (pos['side'] == 'sell' and mid <= pos['target_price'])
-            # Stop‑loss (market exit, 0.1% fee)
+            # Check stop-loss (market exit, 0.1% fee)
             hit_sl = (pos['side'] == 'buy' and mid <= pos['stop_price']) or \
                      (pos['side'] == 'sell' and mid >= pos['stop_price'])
 
@@ -188,13 +210,9 @@ class HybridScalper:
                 self.close_win(sym, pos['target_price'])
             elif hit_sl:
                 exit_price = book.best_bid() if pos['side'] == 'buy' else book.best_ask()
-                self.close_loss(sym, exit_price, "SL")
-            elif now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
-                exit_price = book.best_bid() if pos['side'] == 'buy' else book.best_ask()
-                self.close_loss(sym, exit_price, "TIMEOUT")
+                self.close_loss(sym, exit_price, "STOP LOSS")
 
     def close_win(self, sym, price):
-        """Close with limit order at take‑profit – 0% maker fee"""
         pos = self.positions.pop(sym)
         gross = pos['quantity'] * price
         fee = gross * MAKER_FEE   # 0%
@@ -209,11 +227,10 @@ class HybridScalper:
 
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
-        print(f"✅ WIN {sym} (LIMIT TP) | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        print(f"✅ WIN {sym} (TAKE PROFIT) | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
     def close_loss(self, sym, price, reason):
-        """Close with market order – pays taker fee (0.1%)"""
         pos = self.positions.pop(sym)
         gross = pos['quantity'] * price
         fee = gross * TAKER_FEE
@@ -231,7 +248,7 @@ class HybridScalper:
 
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
-        print(f"{'✅' if profit>0 else '❌'} {reason} {sym} (MARKET) | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        print(f"{'✅' if profit>0 else '❌'} {reason} {sym} | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
     async def run(self):
@@ -241,9 +258,9 @@ class HybridScalper:
         for sym in CONFIG["SYMBOLS"]:
             asyncio.create_task(self.subscribe_depth(sym))
 
-        print("\n🚀 HYBRID SCALPER – MARKET ENTRY + LIMIT TP (0% FEE ON WINS)")
-        print(f"   TP: 0.08% gross → 0.04% net | SL: 0.06% | Max hold: {CONFIG['MAX_HOLD_SECONDS']}s")
-        print(f"   Position: ${CONFIG['ORDER_SIZE_USDT']} | OFI threshold: {CONFIG['OFI_THRESHOLD']}\n")
+        print("\n🚀 TRAILING SCALPER – NO TIMEOUT, TRAILING STOP")
+        print(f"   TP: 0.08% | SL: 0.06% | Trail: 0.02% | Position: ${CONFIG['ORDER_SIZE_USDT']}")
+        print(f"   OFI threshold: {CONFIG['OFI_THRESHOLD']}\n")
 
         last_ofi_print = 0
         last_refresh = time.time()
@@ -266,7 +283,6 @@ class HybridScalper:
 
                 self.check_positions()
 
-                # Open new positions – one per symbol
                 for sym in CONFIG["SYMBOLS"]:
                     if sym in self.positions:
                         continue
@@ -275,10 +291,10 @@ class HybridScalper:
                         continue
                     ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
                     if ofi > CONFIG["OFI_THRESHOLD"]:
-                        print(f"⚡ {sym} OFI: {ofi:.3f} → MARKET BUY")
+                        print(f"⚡ {sym} OFI: {ofi:.3f} → BUY")
                         self.open_market_position(sym, 'buy')
                     elif ofi < -CONFIG["OFI_THRESHOLD"]:
-                        print(f"⚡ {sym} OFI: {ofi:.3f} → MARKET SELL")
+                        print(f"⚡ {sym} OFI: {ofi:.3f} → SELL")
                         self.open_market_position(sym, 'sell')
 
                 if now - self.daily_start >= 86400:
@@ -290,6 +306,6 @@ class HybridScalper:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(HybridScalper().run())
+        asyncio.run(TrailingScalper().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")
