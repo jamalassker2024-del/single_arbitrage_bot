@@ -2,18 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-FINAL AGGRESSIVE SCALPER – LIMIT ORDERS, 0% FEES, HIGH FREQUENCY
-- Opens trades when OFI > 0.50 (lower threshold for more signals)
-- One trade per symbol concurrently (multiple symbols active)
-- Limit entry at best bid + 1 tick (aggressive but still maker)
-- TP: 0.02% (limit exit, 0% fee), SL: 0.05% (market exit, 0.1% fee)
-- Entry timeout: 2 seconds, Max hold: 8 seconds
-- Per‑symbol cooldown: 1s after win, 20s after loss
+AGGRESSIVE LIMIT SCALPER – WITH REST SNAPSHOT + WS UPDATES
+- Fetches initial order book via REST
+- Applies WebSocket depth diffs
+- Opens trades when OFI > 0.50
 """
 
 import asyncio
 import json
 import websockets
+import aiohttp
 from decimal import Decimal, getcontext
 import time
 
@@ -23,11 +21,11 @@ CONFIG = {
     "SYMBOLS": ["NEIROUSDT", "DOGSUSDT", "PEPEUSDT", "1000FLOKIUSDT", "WIFUSDT"],
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
-    "OFI_THRESHOLD": Decimal("0.50"),          # Lowered for more signals
-    "TAKE_PROFIT_BPS": Decimal("2"),           # 0.02% pure profit (0% fee)
-    "STOP_LOSS_BPS": Decimal("5"),             # 0.05% loss (market exit)
-    "MAX_HOLD_SECONDS": 8,                     # Fast exit
-    "ENTRY_TIMEOUT_SEC": 2,                    # Cancel unfilled entry after 2s
+    "OFI_THRESHOLD": Decimal("0.50"),
+    "TAKE_PROFIT_BPS": Decimal("2"),
+    "STOP_LOSS_BPS": Decimal("5"),
+    "MAX_HOLD_SECONDS": 8,
+    "ENTRY_TIMEOUT_SEC": 2,
     "WIN_COOLDOWN_SEC": 1,
     "LOSS_COOLDOWN_SEC": 20,
     "SCAN_INTERVAL_MS": 20,
@@ -40,8 +38,8 @@ TAKER_FEE = Decimal("0.001")
 class AggressiveScalper:
     def __init__(self):
         self.order_books = {}
-        self.positions = {}          # filled positions (active)
-        self.pending_entries = {}    # limit orders waiting to fill
+        self.positions = {}
+        self.pending_entries = {}
         self.balance = CONFIG["INITIAL_BALANCE"]
         self.total_trades = 0
         self.winning_trades = 0
@@ -56,7 +54,15 @@ class AggressiveScalper:
             self.asks = {}
             self.last_update = 0
 
+        def set_snapshot(self, bids, asks):
+            """Initialize order book with REST snapshot"""
+            self.bids = {Decimal(p): Decimal(q) for p, q in bids}
+            self.asks = {Decimal(p): Decimal(q) for p, q in asks}
+            self.last_update = time.time()
+            print(f"📸 Snapshot loaded for {self.symbol}: {len(self.bids)} bids, {len(self.asks)} asks")
+
         def apply_depth(self, data):
+            """Apply depth delta update"""
             for side, key in [('bids', 'b'), ('asks', 'a')]:
                 book_side = getattr(self, side)
                 for p, q in data.get(key, []):
@@ -74,12 +80,11 @@ class AggressiveScalper:
             return min(self.asks.keys()) if self.asks else Decimal('0')
 
         def tick_size(self):
-            # Estimate tick size from the smallest price increment (for aggressive placement)
             if self.bids:
                 prices = sorted(self.bids.keys())
                 if len(prices) > 1:
                     return abs(prices[1] - prices[0])
-            return Decimal('0.00000001')  # default for meme coins
+            return Decimal('0.00000001')
 
         def get_ofi(self, depth=5):
             sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:depth]
@@ -90,22 +95,37 @@ class AggressiveScalper:
                 return Decimal('0')
             return (bid_vol - ask_vol) / (bid_vol + ask_vol)
 
+    async def fetch_snapshot(self, symbol):
+        url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=20"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                return data['bids'], data['asks']
+
     async def subscribe_depth(self, symbol):
-        url = f"{CONFIG['BINANCE_WS']}/{symbol.lower()}@depth20@100ms"
-        async with websockets.connect(url) as ws:
-            while self.running:
-                data = json.loads(await ws.recv())
-                self.order_books[symbol].apply_depth(data)
+        # First get snapshot
+        bids, asks = await self.fetch_snapshot(symbol)
+        self.order_books[symbol].set_snapshot(bids, asks)
+
+        stream = f"{symbol.lower()}@depth20@100ms"
+        url = f"{CONFIG['BINANCE_WS']}/{stream}"
+        while self.running:
+            try:
+                async with websockets.connect(url) as ws:
+                    async for msg in ws:
+                        data = json.loads(msg)
+                        self.order_books[symbol].apply_depth(data)
+            except Exception as e:
+                print(f"⚠️ WebSocket error for {symbol}: {e}. Reconnecting in 3s...")
+                await asyncio.sleep(3)
 
     def place_entry_limit(self, symbol, side):
         book = self.order_books[symbol]
-        # Aggressive limit placement: buy at best_bid + 1 tick (still maker if below ask)
         if side == 'buy':
             base = book.best_bid()
             if base <= 0:
                 return
             price = base + book.tick_size()
-            # Ensure we don't cross the spread
             if price >= book.best_ask():
                 price = book.best_ask() - book.tick_size()
         else:
@@ -115,7 +135,6 @@ class AggressiveScalper:
             price = base - book.tick_size()
             if price <= book.best_bid():
                 price = book.best_bid() + book.tick_size()
-
         if price <= 0:
             return
 
@@ -131,21 +150,16 @@ class AggressiveScalper:
     def check_fills_and_positions(self):
         now = time.time()
 
-        # 1. Check pending entry limits
+        # Check pending entries
         for sym in list(self.pending_entries.keys()):
             order = self.pending_entries[sym]
             book = self.order_books[sym]
-
-            # Real fill condition: buy fills when best_ask <= limit_price
             filled = (order['side'] == 'buy' and book.best_ask() <= order['price']) or \
                      (order['side'] == 'sell' and book.best_bid() >= order['price'])
-
             if filled:
-                # Entry filled
                 self.balance -= CONFIG["ORDER_SIZE_USDT"]
                 tp = order['price'] * (1 + CONFIG["TAKE_PROFIT_BPS"]/10000) if order['side'] == 'buy' else order['price'] * (1 - CONFIG["TAKE_PROFIT_BPS"]/10000)
                 sl = order['price'] * (1 - CONFIG["STOP_LOSS_BPS"]/10000) if order['side'] == 'buy' else order['price'] * (1 + CONFIG["STOP_LOSS_BPS"]/10000)
-
                 self.positions[sym] = {
                     'side': order['side'],
                     'entry': order['price'],
@@ -158,19 +172,16 @@ class AggressiveScalper:
                 print(f"✅ FILLED: {sym} @ {order['price']:.8f} | TP limit @ {tp:.8f}")
             elif now - order['timestamp'] > CONFIG["ENTRY_TIMEOUT_SEC"]:
                 del self.pending_entries[sym]
-                print(f"⌛ ENTRY TIMEOUT: {sym} cancelled (price moved away)")
+                print(f"⌛ ENTRY TIMEOUT: {sym} cancelled")
 
-        # 2. Check active positions
+        # Check active positions
         for sym in list(self.positions.keys()):
             pos = self.positions[sym]
             book = self.order_books[sym]
-
             hit_tp = (pos['side'] == 'buy' and book.best_bid() >= pos['tp']) or \
                      (pos['side'] == 'sell' and book.best_ask() <= pos['tp'])
-
             hit_sl = (pos['side'] == 'buy' and book.best_bid() <= pos['sl']) or \
                      (pos['side'] == 'sell' and book.best_ask() >= pos['sl'])
-
             if hit_tp:
                 self.close_trade(sym, pos['tp'], "WIN (LIMIT)")
             elif hit_sl:
@@ -184,16 +195,13 @@ class AggressiveScalper:
         pos = self.positions.pop(sym)
         is_market = "MARKET" in reason
         fee_rate = TAKER_FEE if is_market else MAKER_FEE
-
         gross = pos['qty'] * price
         fee_amt = gross * fee_rate
         cost = pos['qty'] * pos['entry']
-
         if pos['side'] == 'buy':
             profit = (gross - cost) - fee_amt
         else:
             profit = (cost - gross) - fee_amt
-
         self.balance += gross - fee_amt
         self.total_trades += 1
         if profit > 0:
@@ -204,7 +212,7 @@ class AggressiveScalper:
         self.last_trade_result[sym] = 'win' if profit > 0 else 'loss'
 
     async def run(self):
-        # Initialize order books
+        # Initialize order books with snapshots
         for sym in CONFIG["SYMBOLS"]:
             self.order_books[sym] = self.OrderBook(sym)
             asyncio.create_task(self.subscribe_depth(sym))
@@ -216,8 +224,6 @@ class AggressiveScalper:
         last_ofi_print = 0
         while self.running:
             now = time.time()
-
-            # Debug: print OFI values every 3 seconds (for monitoring)
             if now - last_ofi_print > 3:
                 ofi_str = []
                 for sym in CONFIG["SYMBOLS"]:
@@ -228,17 +234,12 @@ class AggressiveScalper:
 
             self.check_fills_and_positions()
 
-            # Open new positions – one per symbol (concurrent)
             for sym in CONFIG["SYMBOLS"]:
-                # Skip if already has open position or pending entry
                 if sym in self.positions or sym in self.pending_entries:
                     continue
-
-                # Cooldown check
                 cooldown = CONFIG["LOSS_COOLDOWN_SEC"] if self.last_trade_result.get(sym) == 'loss' else CONFIG["WIN_COOLDOWN_SEC"]
                 if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown:
                     continue
-
                 ofi = self.order_books[sym].get_ofi()
                 if ofi > CONFIG["OFI_THRESHOLD"]:
                     print(f"⚡ {sym} OFI: {ofi:.3f} → BUY")
