@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-FINAL HYBRID SCALPER – NO TIMEOUT, TRAILING STOP
-- Market entry (instant, 0.1% fee)
-- Take-profit limit order (0% fee)
-- Hard stop-loss (0.1% fee)
-- Trailing stop: locks in profit, moves SL to breakeven after 0.02% gain
-- No fixed timer – trades close only via price action
+FINAL TRAILING SCALPER – NO TIMEOUT, FIXED KEYERROR
+- Market entry (0.1% fee)
+- Take-profit limit order (0% fee) at 0.12% gross → 0.02% net
+- Hard stop-loss (0.1% fee) at 0.06%
+- Trailing stop: locks in profit after 0.02% gain, moves stop to breakeven then trails
+- No timeout – trades close only via TP, SL, or trailing stop
 """
 
 import asyncio
@@ -25,9 +25,9 @@ CONFIG = {
     "INITIAL_BALANCE": Decimal("100.00"),
     "OFI_LEVELS": 5,
     "OFI_THRESHOLD": Decimal("0.55"),
-    "TAKE_PROFIT_BPS": Decimal("8"),          # 0.08% gross profit
-    "STOP_LOSS_BPS": Decimal("6"),            # 0.06% initial stop loss
-    "TRAIL_BPS": Decimal("2"),                # 0.02% trail distance
+    "TAKE_PROFIT_BPS": Decimal("12"),          # 0.12% gross → net 0.02% after 0.1% entry fee
+    "STOP_LOSS_BPS": Decimal("6"),             # 0.06% initial stop loss
+    "TRAIL_BPS": Decimal("2"),                 # 0.02% trail distance
     "WIN_COOLDOWN_SEC": 1,
     "LOSS_COOLDOWN_SEC": 15,
     "SCAN_INTERVAL_MS": 20,
@@ -147,11 +147,11 @@ class TrailingScalper:
         if side == 'buy':
             target_price = price * (Decimal("1") + tp_bps / Decimal("10000"))
             stop_price = price * (Decimal("1") - sl_bps / Decimal("10000"))
-            best_price = price   # for trailing: highest price seen
+            best_price = price
         else:
             target_price = price * (Decimal("1") - tp_bps / Decimal("10000"))
             stop_price = price * (Decimal("1") + sl_bps / Decimal("10000"))
-            best_price = price   # for trailing: lowest price seen
+            best_price = price
 
         self.positions[symbol] = {
             'side': side,
@@ -165,44 +165,42 @@ class TrailingScalper:
             'entry_time': time.time(),
         }
 
-        expected_profit = order_size * tp_bps / Decimal("10000") - order_size * TAKER_FEE
-        print(f"⚡ {symbol} MARKET {side.upper()} @ {price:.8f} | ${order_size:.2f} | Target net: +${expected_profit:.4f}")
+        # Expected net profit after entry fee (limit exit has 0% fee)
+        net_profit = order_size * tp_bps / Decimal("10000") - order_size * TAKER_FEE
+        print(f"⚡ {symbol} MARKET {side.upper()} @ {price:.8f} | ${order_size:.2f} | Target net: +${net_profit:.4f}")
         return True
 
-    def update_trailing_stop(self, pos, current_price):
+    def update_trailing_stop(self, symbol, pos, current_price):
         """Update stop price for trailing stop."""
         if pos['side'] == 'buy':
-            # For long: track highest price, move stop up
             if current_price > pos['best_price']:
                 pos['best_price'] = current_price
                 new_stop = current_price * (Decimal("1") - pos['trail_bps'] / Decimal("10000"))
                 if new_stop > pos['stop_price']:
                     pos['stop_price'] = new_stop
-                    print(f"  🔼 Trail: {pos['symbol']} stop moved to {new_stop:.8f}")
+                    print(f"  🔼 Trail {symbol}: stop moved to {new_stop:.8f}")
         else:
-            # For short: track lowest price, move stop down
             if current_price < pos['best_price']:
                 pos['best_price'] = current_price
                 new_stop = current_price * (Decimal("1") + pos['trail_bps'] / Decimal("10000"))
                 if new_stop < pos['stop_price']:
                     pos['stop_price'] = new_stop
-                    print(f"  🔽 Trail: {pos['symbol']} stop moved to {new_stop:.8f}")
+                    print(f"  🔽 Trail {symbol}: stop moved to {new_stop:.8f}")
 
     def check_positions(self):
-        for sym in list(self.positions.keys()):
-            pos = self.positions[sym]
+        for sym, pos in list(self.positions.items()):
             book = self.order_books[sym]
             mid = book.mid_price()
             if mid <= 0:
                 continue
 
-            # Update trailing stop first
-            self.update_trailing_stop(pos, mid)
+            # Update trailing stop
+            self.update_trailing_stop(sym, pos, mid)
 
-            # Check take-profit (limit exit, 0% fee)
+            # Take-profit (limit exit, 0% fee)
             hit_tp = (pos['side'] == 'buy' and mid >= pos['target_price']) or \
                      (pos['side'] == 'sell' and mid <= pos['target_price'])
-            # Check stop-loss (market exit, 0.1% fee)
+            # Stop-loss (market exit, 0.1% fee)
             hit_sl = (pos['side'] == 'buy' and mid <= pos['stop_price']) or \
                      (pos['side'] == 'sell' and mid >= pos['stop_price'])
 
@@ -258,8 +256,8 @@ class TrailingScalper:
         for sym in CONFIG["SYMBOLS"]:
             asyncio.create_task(self.subscribe_depth(sym))
 
-        print("\n🚀 TRAILING SCALPER – NO TIMEOUT, TRAILING STOP")
-        print(f"   TP: 0.08% | SL: 0.06% | Trail: 0.02% | Position: ${CONFIG['ORDER_SIZE_USDT']}")
+        print("\n🚀 TRAILING SCALPER – NO TIMEOUT, FIXED")
+        print(f"   TP: 0.12% gross → 0.02% net | SL: 0.06% | Trail: 0.02% | Position: ${CONFIG['ORDER_SIZE_USDT']}")
         print(f"   OFI threshold: {CONFIG['OFI_THRESHOLD']}\n")
 
         last_ofi_print = 0
