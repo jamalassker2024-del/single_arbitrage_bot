@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-FIXED PROFITABLE BOT – WIDER STOP LOSS + CONFIRMATION
-- TP: 0.08% (bigger profit per win)
-- SL: 0.12% (wider to avoid noise)
-- Entry confirmation: require OFI to stay strong for 2 consecutive reads
-- Max hold: 60 seconds
+ULTIMATE HIGH-VOLATILITY BOT – $5 POSITIONS, FASTEST MOVING PAIRS
+- Most volatile pairs on Binance (meme coins + high-beta alts)
+- $5 position size for meaningful profit
+- Ultra-fast TP: 0.04% (hits in seconds on volatile pairs)
+- Aggressive entry: no confirmation needed
+- 20 second max hold – cut losses fast
 """
 
 import asyncio
@@ -19,20 +20,31 @@ from collections import deque
 
 getcontext().prec = 12
 
+# ========== MOST VOLATILE PAIRS ON BINANCE ==========
 CONFIG = {
-    "SYMBOLS": ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "PEPEUSDT", "SUIUSDT"],
-    "ORDER_SIZE_USDT": Decimal("1.00"),
-    "INITIAL_BALANCE": Decimal("20.00"),
-    "OFI_LEVELS": 8,
-    "OFI_THRESHOLD": Decimal("0.65"),
-    "OFI_CONFIRMATIONS": 2,                    # Require 2 consecutive strong readings
-    "TAKE_PROFIT_BPS": Decimal("8"),           # 0.08% (bigger profit)
-    "STOP_LOSS_BPS": Decimal("12"),            # 0.12% (wider to avoid noise)
-    "MAX_HOLD_SECONDS": 60,                    # More time to hit TP
-    "WIN_COOLDOWN_SEC": 2,
-    "LOSS_COOLDOWN_SEC": 45,
-    "SCAN_INTERVAL_MS": 100,
-    "REFRESH_BOOK_SEC": 30,
+    "SYMBOLS": [
+        "PEPEUSDT",    # #1 meme coin – moves constantly
+        "WIFUSDT",     # Dogwifhat – extreme volatility
+        "BONKUSDT",    # Bonk – huge swings
+        "FLOKIUSDT",   # Floki – strong momentum
+        "DOGSUSDT",    # Dogs – new high volatility
+        "NEIROUSDT",   # Neiro – meme coin
+        "SUIUSDT",     # Sui – volatile L1
+        "SEIUSDT",     # Sei – high beta
+        "WUSDT",       # Wormhole – volatile
+        "1000PEPEUSDT" # PEPE 1000x leverage pair
+    ],
+    "ORDER_SIZE_USDT": Decimal("5.00"),        # $5 per trade
+    "INITIAL_BALANCE": Decimal("100.00"),      # $100 starting balance
+    "OFI_LEVELS": 5,                           # Fast response
+    "OFI_THRESHOLD": Decimal("0.50"),          # Strong signals only
+    "TAKE_PROFIT_BPS": Decimal("4"),           # 0.04% – super fast hits
+    "STOP_LOSS_BPS": Decimal("6"),             # 0.06% – tight but fair
+    "MAX_HOLD_SECONDS": 20,                    # Fast exit
+    "WIN_COOLDOWN_SEC": 1,
+    "LOSS_COOLDOWN_SEC": 15,                   # Quick recovery
+    "SCAN_INTERVAL_MS": 30,                   # Ultra-fast scanning
+    "REFRESH_BOOK_SEC": 15,
     "BINANCE_WS": "wss://stream.binance.com:9443/ws",
 }
 
@@ -45,7 +57,7 @@ class OrderBook:
         self.bids = {}
         self.asks = {}
         self.last_update = 0.0
-        self.ofi_history = deque(maxlen=10)
+        self.ofi_history = deque(maxlen=3)
 
     def apply_depth(self, data):
         for side, key in [('bids', 'b'), ('asks', 'a')]:
@@ -68,7 +80,7 @@ class OrderBook:
         bb, ba = self.best_bid(), self.best_ask()
         return (bb + ba) / 2 if bb and ba else Decimal('0')
 
-    def get_ofi(self, depth=8):
+    def get_ofi(self, depth=5):
         sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:depth]
         sorted_asks = sorted(self.asks.items(), key=lambda x: x[0])[:depth]
         bid_vol = sum(q for _, q in sorted_bids)
@@ -78,16 +90,6 @@ class OrderBook:
         ofi = (bid_vol - ask_vol) / (bid_vol + ask_vol)
         self.ofi_history.append(ofi)
         return ofi
-
-    def is_signal_confirmed(self, threshold):
-        """Require last N OFI readings to all exceed threshold"""
-        if len(self.ofi_history) < CONFIG["OFI_CONFIRMATIONS"]:
-            return False, 0
-        recent = list(self.ofi_history)[-CONFIG["OFI_CONFIRMATIONS"]:]
-        if all(abs(o) > threshold for o in recent):
-            direction = 1 if recent[-1] > 0 else -1
-            return True, direction
-        return False, 0
 
     async def refresh_snapshot(self, session):
         url = f"https://api.binance.com/api/v3/depth?symbol={self.symbol}&limit=20"
@@ -101,7 +103,7 @@ class OrderBook:
         except Exception:
             return False
 
-class FixedProfitBot:
+class UltimateVolatilityBot:
     def __init__(self):
         self.order_books = {s: OrderBook(s) for s in CONFIG["SYMBOLS"]}
         self.positions = {}
@@ -112,7 +114,6 @@ class FixedProfitBot:
         self.daily_start = time.time()
         self.last_trade_time = {}
         self.last_trade_result = {}
-        self.entry_pending = {}  # Track symbols waiting for confirmation
         self.running = True
 
     async def load_snapshots(self, session):
@@ -142,7 +143,7 @@ class FixedProfitBot:
         order_size = CONFIG["ORDER_SIZE_USDT"]
         if order_size > self.balance:
             order_size = self.balance * Decimal("0.95")
-            if order_size < Decimal("0.10"):
+            if order_size < Decimal("0.50"):
                 return False
         
         qty = order_size / price
@@ -172,7 +173,7 @@ class FixedProfitBot:
         }
         
         expected_profit = order_size * (CONFIG["TAKE_PROFIT_BPS"] / Decimal("10000"))
-        print(f"📈 {symbol} {side.upper()} @ {price:.4f} | ${order_size:.2f} | Target: +${expected_profit:.5f}")
+        print(f"📈 {symbol} {side.upper()} @ {price:.8f} | ${order_size:.2f} | Target: +${expected_profit:.4f}")
         return True
 
     def check_positions(self, symbol):
@@ -221,7 +222,7 @@ class FixedProfitBot:
         
         profit_pct = (profit / pos['order_size'] * 100)
         win_rate = (self.winning_trades / self.total_trades * 100)
-        print(f"✅ WIN {symbol} | Profit: ${profit:.5f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        print(f"✅ WIN {symbol} | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[symbol] = time.time()
 
     def close_loss(self, symbol, exit_price, reason):
@@ -241,7 +242,7 @@ class FixedProfitBot:
         
         profit_pct = (profit / pos['order_size'] * 100)
         win_rate = (self.winning_trades / self.total_trades * 100)
-        print(f"❌ LOSS {symbol} {reason} | Profit: ${profit:.5f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        print(f"❌ LOSS {symbol} {reason} | Profit: ${profit:.4f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[symbol] = time.time()
 
     async def run(self):
@@ -251,9 +252,10 @@ class FixedProfitBot:
         for sym in CONFIG["SYMBOLS"]:
             asyncio.create_task(self.subscribe_depth(sym))
         
-        print("\n🚀 FIXED PROFIT BOT – WIDER SL + CONFIRMATION")
-        print(f"   Size: ${CONFIG['ORDER_SIZE_USDT']} | TP: 0.08% | SL: 0.12%")
-        print(f"   Confirmations: {CONFIG['OFI_CONFIRMATIONS']} | Loss cooldown: {CONFIG['LOSS_COOLDOWN_SEC']}s\n")
+        print("\n🚀 ULTIMATE HIGH-VOLATILITY BOT")
+        print(f"   Pairs: {len(CONFIG['SYMBOLS'])} volatile meme coins & alts")
+        print(f"   Position size: ${CONFIG['ORDER_SIZE_USDT']} | TP: 0.04% | SL: 0.06%")
+        print(f"   Max hold: {CONFIG['MAX_HOLD_SECONDS']}s | Loss cooldown: {CONFIG['LOSS_COOLDOWN_SEC']}s\n")
         
         last_hb = 0
         last_ofi_debug = 0
@@ -268,12 +270,12 @@ class FixedProfitBot:
                         await self.order_books[sym].refresh_snapshot(session)
                     last_refresh = now
                 
-                # Debug OFI
+                # Debug OFI (only strong signals)
                 if now - last_ofi_debug > 5:
                     strong = []
                     for sym in CONFIG["SYMBOLS"]:
                         ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
-                        if abs(ofi) > 0.3:
+                        if abs(ofi) > 0.35:
                             strong.append(f"{sym}:{ofi:.3f}")
                     if strong:
                         print(f"🔍 OFI: {' | '.join(strong)}")
@@ -283,8 +285,8 @@ class FixedProfitBot:
                 for sym in list(self.positions.keys()):
                     self.check_positions(sym)
                 
-                # Open new positions with confirmation
-                if self.balance >= Decimal("0.20"):
+                # Open new positions
+                if self.balance >= Decimal("1.00"):
                     for sym in CONFIG["SYMBOLS"]:
                         if sym in self.positions:
                             continue
@@ -293,20 +295,18 @@ class FixedProfitBot:
                         if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown:
                             continue
                         
-                        book = self.order_books[sym]
-                        confirmed, direction = book.is_signal_confirmed(CONFIG["OFI_THRESHOLD"])
+                        ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
                         
-                        if confirmed:
-                            if direction == 1:
-                                print(f"⚡ {sym} OFI CONFIRMED → BUY")
-                                self.open_position(sym, 'buy')
-                            else:
-                                print(f"⚡ {sym} OFI CONFIRMED → SELL")
-                                self.open_position(sym, 'sell')
+                        if ofi > CONFIG["OFI_THRESHOLD"]:
+                            print(f"⚡ {sym} OFI: {ofi:.3f} → BUY")
+                            self.open_position(sym, 'buy')
+                        elif ofi < -CONFIG["OFI_THRESHOLD"]:
+                            print(f"⚡ {sym} OFI: {ofi:.3f} → SELL")
+                            self.open_position(sym, 'sell')
                 
                 # Daily summary
                 if now - self.daily_start >= 86400:
-                    print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.5f} | Balance: ${self.balance:.2f}\n")
+                    print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.4f} | Balance: ${self.balance:.2f}\n")
                     self.daily_profit = Decimal('0')
                     self.daily_start = now
                 
@@ -319,7 +319,7 @@ class FixedProfitBot:
                 await asyncio.sleep(CONFIG["SCAN_INTERVAL_MS"] / 1000.0)
 
 if __name__ == "__main__":
-    bot = FixedProfitBot()
+    bot = UltimateVolatilityBot()
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
